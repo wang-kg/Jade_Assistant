@@ -34,7 +34,3 @@ py game_shop_helper.py
 4. 按 **F9** 退出程序。鼠标移至屏幕左上角也可触发紧急停止。
 
 程序会在游戏窗口左下角显示当前状态。
-
-## GitHub 描述
-
-An automation tool for Honkai: Star Rail's Black Market Manager bond, helping players automatically refresh shops and purchase target items.
