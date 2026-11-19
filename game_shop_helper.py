@@ -2,7 +2,7 @@
 """
 游戏轮换商品辅助脚本
 F8：开始/暂停    F9：退出
-使用 2560x1440 截图作为参考；识别三个轮换商品位中的目标图标。
+使用 2560x1440 截图作为参考；识别三个轮换商品位中的目标商品名称。
 """
 # 必须在图形/鼠标库导入前启用物理屏幕坐标，避免 Windows 缩放造成坐标偏移。
 import ctypes
@@ -22,9 +22,9 @@ if not dpi_ok:
     except (AttributeError, OSError, TypeError, ValueError):
         pass
 
-from pathlib import Path
 import time
 import threading
+import unicodedata
 
 import cv2
 import mss
@@ -37,29 +37,24 @@ import keyboard
 from game_status_overlay import StatusOverlay
 
 REFERENCE_WIDTH, REFERENCE_HEIGHT = 2560, 1440
-# 坐标相对于 2560x1440 参考截图；在每个商品位内留出图标移动余量。
-TARGET_SEARCH_ROIS = (
-    {"left": 794, "top": 305, "width": 140, "height": 140},
-    {"left": 1129, "top": 305, "width": 140, "height": 140},
-    {"left": 1468, "top": 305, "width": 140, "height": 140},
+# 各商品名称行相对于 2560x1440 参考客户区的位置，避开右侧价格和货币图标。
+TARGET_LABEL_ROIS = (
+    {"left": 735, "top": 516, "width": 180, "height": 52},
+    {"left": 1072, "top": 516, "width": 180, "height": 52},
+    {"left": 1408, "top": 516, "width": 180, "height": 52},
 )
-TARGET_TEMPLATE_SIZE = (112, 112)
+TARGET_ITEM_NAME = "10小队生命值"
+OCR_MIN_CONFIDENCE = 0.65
+OCR_LINE_HEIGHT = 48
 TARGET_CLICKS = ((865, 375), (1199, 375), (1539, 375))
 FEATURED_CLICK = (1905, 375)
 REFRESH_CLICK = (1200, 683)
 GAME_TITLE_HINTS = ("崩坏：星穹铁道", "Honkai: Star Rail")
 GAME_PROCESS_NAMES = {"starrail", "starrail.exe"}
 FEATURED_CLICKS = 9
-MATCH_THRESHOLD = 0.82
-POLL_DELAY = 0.25
-POST_CLICK_WAIT = 1.6
+POST_CLICK_CHECK_DELAY = 0.5
+REFRESH_WAIT = 0.5
 
-BASE = Path(__file__).resolve().parent
-TEMPLATE_PATHS = (
-    BASE / "target_template_left.png",
-    BASE / "target_template_mid.png",
-    BASE / "target_template_right.png",
-)
 
 active = threading.Event()
 quit_requested = threading.Event()
@@ -68,9 +63,9 @@ last_toggle = 0.0
 status_overlay = None
 game_hwnd = None
 hotkey_thread = None
-_scaled_template_cache = {}
 
-pyautogui.PAUSE = 0.12
+# 保留 click_at 的 75ms 按住时间，只缩短 pyautogui 每次调用后的额外等待。
+pyautogui.PAUSE = 0.03
 pyautogui.FAILSAFE = True
 
 
@@ -198,82 +193,83 @@ def hotkey_listener():
             pass
 
 
-def _scaled_templates(templates, sx, sy):
-    """按客户区尺寸缓存模板缩放结果，避免每轮重复 resize。"""
-    width = max(1, round(TARGET_TEMPLATE_SIZE[0] * sx))
-    height = max(1, round(TARGET_TEMPLATE_SIZE[1] * sy))
-    cache_key = (width, height)
-    cached = _scaled_template_cache.get(cache_key)
-    if cached is None:
-        interpolation = cv2.INTER_AREA if sx < 1 or sy < 1 else cv2.INTER_CUBIC
-        cached = tuple(
-            template if template.shape[:2] == (height, width)
-            else cv2.resize(template, (width, height), interpolation=interpolation)
-            for template in templates
+def _label_roi(slot, sx, sy):
+    roi = TARGET_LABEL_ROIS[slot]
+    return (
+        round(roi["left"] * sx), round(roi["top"] * sy),
+        max(1, round(roi["width"] * sx)), max(1, round(roi["height"] * sy)),
+    )
+
+
+def _recognize_target_label(ocr, image):
+    """在已知商品名称行上直接做文字识别，不执行整图文字检测。"""
+    if image.shape[0] < OCR_LINE_HEIGHT:
+        scale = min(2.0, OCR_LINE_HEIGHT / image.shape[0])
+        image = cv2.resize(
+            image,
+            (max(1, round(image.shape[1] * scale)), OCR_LINE_HEIGHT),
+            interpolation=cv2.INTER_CUBIC,
         )
-        _scaled_template_cache[cache_key] = cached
-    return cached
+
+    result = ocr(image, use_det=False, use_cls=False, use_rec=True)
+    texts = getattr(result, "txts", ()) or ()
+    scores = getattr(result, "scores", ()) or ()
+    normalized_target = unicodedata.normalize("NFKC", TARGET_ITEM_NAME)
+    best_score = 0.0
+    for index, text in enumerate(texts):
+        confidence = float(scores[index]) if index < len(scores) else 0.0
+        best_score = max(best_score, confidence)
+        normalized_text = "".join(
+            char for char in unicodedata.normalize("NFKC", str(text))
+            if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+        )
+        if normalized_target in normalized_text and confidence >= OCR_MIN_CONFIDENCE:
+            return True, confidence
+    return False, best_score
 
 
-def _score_search_area(gray, offset_x, offset_y, search_roi, sx, sy, templates):
-    x = round(search_roi["left"] * sx) - offset_x
-    y = round(search_roi["top"] * sy) - offset_y
-    width = max(1, round(search_roi["width"] * sx))
-    height = max(1, round(search_roi["height"] * sy))
-    area = gray[y:y + height, x:x + width]
-    score = 0.0
-    for template in templates:
-        result = cv2.matchTemplate(area, template, cv2.TM_CCOEFF_NORMED)
-        score = max(score, float(result.max()))
-    return score
-
-
-def find_target_slots(sct, templates):
-    """一次截取三个商品位的总区域并转灰度，再扫描各位，返回匹配的 (槽位, 分数)。"""
+def find_target_slots(sct, ocr):
+    """一次截取三个商品名称行，再逐行识别目标名称。"""
     _, left, top, width, height = game_window_geometry()
     sx, sy = width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT
-    roi_left = min(roi["left"] for roi in TARGET_SEARCH_ROIS)
-    roi_top = min(roi["top"] for roi in TARGET_SEARCH_ROIS)
-    roi_right = max(roi["left"] + roi["width"] for roi in TARGET_SEARCH_ROIS)
-    roi_bottom = max(roi["top"] + roi["height"] for roi in TARGET_SEARCH_ROIS)
-    scaled_left, scaled_top = round(roi_left * sx), round(roi_top * sy)
-    scaled_right, scaled_bottom = round(roi_right * sx), round(roi_bottom * sy)
-    capture = {
-        "left": left + scaled_left,
-        "top": top + scaled_top,
-        "width": scaled_right - scaled_left,
-        "height": scaled_bottom - scaled_top,
-    }
-    frame = np.asarray(sct.grab(capture))
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-    templates = _scaled_templates(templates, sx, sy)
+    regions = [_label_roi(slot, sx, sy) for slot in range(len(TARGET_LABEL_ROIS))]
+    capture_left = min(region[0] for region in regions)
+    capture_top = min(region[1] for region in regions)
+    capture_right = max(region[0] + region[2] for region in regions)
+    capture_bottom = max(region[1] + region[3] for region in regions)
+    frame = np.asarray(sct.grab({
+        "left": left + capture_left,
+        "top": top + capture_top,
+        "width": capture_right - capture_left,
+        "height": capture_bottom - capture_top,
+    }))
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
     matches = []
-    for slot, search_roi in enumerate(TARGET_SEARCH_ROIS):
-        score = _score_search_area(
-            gray, scaled_left, scaled_top, search_roi, sx, sy, templates
-        )
-        if score >= MATCH_THRESHOLD:
+    for slot, (x, y, roi_width, roi_height) in enumerate(regions):
+        crop = frame[
+            y - capture_top:y - capture_top + roi_height,
+            x - capture_left:x - capture_left + roi_width,
+        ]
+        found, score = _recognize_target_label(ocr, crop)
+        if found:
             matches.append((slot, score))
+            break
     return matches
 
 
-def target_still_at_slot(sct, templates, slot):
-    """购买回执只检查刚点击的商品位，避免重复扫描另外两格。"""
+def target_still_at_slot(sct, ocr, slot):
+    """购买回执只 OCR 刚点击的商品名称行。"""
     _, left, top, width, height = game_window_geometry()
     sx, sy = width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT
-    search_roi = TARGET_SEARCH_ROIS[slot]
-    x, y = round(search_roi["left"] * sx), round(search_roi["top"] * sy)
-    roi_width = max(1, round(search_roi["width"] * sx))
-    roi_height = max(1, round(search_roi["height"] * sy))
+    x, y, roi_width, roi_height = _label_roi(slot, sx, sy)
     frame = np.asarray(sct.grab({
         "left": left + x, "top": top + y,
         "width": roi_width, "height": roi_height,
     }))
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-    templates = _scaled_templates(templates, sx, sy)
-    score = _score_search_area(gray, x, y, search_roi, sx, sy, templates)
-    return score >= MATCH_THRESHOLD, score
+    image = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    found, score = _recognize_target_label(ocr, image)
+    return found, score
 
 
 def click_at(position):
@@ -313,24 +309,15 @@ def wait_active():
     return not quit_requested.is_set()
 
 
-def click_target_and_check(sct, template, slot):
+def click_target_and_check(sct, ocr, slot):
     if not click_at(TARGET_CLICKS[slot]):
         return None, 0.0
-    deadline = time.monotonic() + POST_CLICK_WAIT
-    score = 1.0
-    while time.monotonic() < deadline:
-        if quit_requested.is_set() or not active.is_set():
-            return None, score
-        try:
-            still_present, score = target_still_at_slot(sct, template, slot)
-        except RuntimeError as exc:
-            pause_with_error(exc)
-            return None, score
-        if not still_present:
-            return True, score
-        time.sleep(POLL_DELAY)
+    time.sleep(POST_CLICK_CHECK_DELAY)
+    if quit_requested.is_set() or not active.is_set():
+        return None, 0.0
+    score = 0.0
     try:
-        still_present, score = target_still_at_slot(sct, template, slot)
+        still_present, score = target_still_at_slot(sct, ocr, slot)
     except RuntimeError as exc:
         pause_with_error(exc)
         return None, score
@@ -338,18 +325,12 @@ def click_target_and_check(sct, template, slot):
 
 
 def main():
-    missing_templates = [str(path) for path in TEMPLATE_PATHS if not path.exists()]
-    if missing_templates:
-        print("找不到目标识别图：" + ", ".join(missing_templates))
+    try:
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        print(f"缺少 RapidOCR 依赖：{exc}")
+        print("请在项目目录运行：py -m pip install -r requirements.txt")
         return 2
-    templates = [cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) for path in TEMPLATE_PATHS]
-    if any(template is None for template in templates):
-        print("至少一张目标识别图无法读取。")
-        return 2
-    if any(template.shape[:2] != (TARGET_TEMPLATE_SIZE[1], TARGET_TEMPLATE_SIZE[0]) for template in templates):
-        print(f"目标识别图尺寸必须是 {TARGET_TEMPLATE_SIZE[0]}x{TARGET_TEMPLATE_SIZE[1]}。")
-        return 2
-
     hwnd = find_game_window()
     if not hwnd:
         print("没有找到崩坏：星穹铁道窗口（StarRail 进程）。请先打开游戏并进入轮换商品界面。")
@@ -362,6 +343,16 @@ def main():
     print(f"已定位游戏窗口：{win32gui.GetWindowText(hwnd) or 'StarRail'}")
     print(f"游戏客户区：{client_size[0]}x{client_size[1]}；点击和识别坐标会按此尺寸缩放。")
 
+    print("正在初始化中文文字识别……")
+    try:
+        ocr_engine = RapidOCR()
+        # 预热识别模型，避免第一次扫描商品时卡顿。
+        ocr_engine(np.zeros((OCR_LINE_HEIGHT, OCR_LINE_HEIGHT * 4, 3), dtype=np.uint8),
+                   use_det=False, use_cls=False, use_rec=True)
+    except Exception as exc:
+        print(f"中文文字识别初始化失败：{exc}")
+        return 2
+    print("文字识别已就绪，目标商品：" + TARGET_ITEM_NAME)
     global status_overlay, game_hwnd, hotkey_thread
     game_hwnd = hwnd
     status_overlay = StatusOverlay()
@@ -381,22 +372,22 @@ def main():
             try:
                 if status_overlay:
                     status_overlay.set_status("识别中", "检查三个轮换商品位")
-                matches = find_target_slots(sct, templates)
+                matches = find_target_slots(sct, ocr_engine)
             except RuntimeError as exc:
                 pause_with_error(exc)
                 continue
             if matches:
                 slot, score = matches[0]
                 if status_overlay:
-                    status_overlay.set_status("发现目标", f"第 {slot + 1} 格，匹配度 {score:.2f}，尝试购买")
-                print(f"识别到第 {slot + 1} 格目标商品（匹配度 {score:.2f}），点击对应商品。")
-                success, score = click_target_and_check(sct, templates, slot)
+                    status_overlay.set_status("发现目标", f"第 {slot + 1} 格，文字置信度 {score:.2f}，尝试购买")
+                print(f"识别到第 {slot + 1} 格目标商品（文字置信度 {score:.2f}），点击对应商品。")
+                success, score = click_target_and_check(sct, ocr_engine, slot)
                 if success is None:
                     continue
                 if not success:
                     if status_overlay:
-                        status_overlay.set_status("购买未确认", "开始点击招牌商品 9 次")
-                    print("商品仍在，点击招牌商品九次后重试。")
+                        status_overlay.set_status(f"第 {slot + 1} 格购买未确认", "开始点击招牌商品 9 次")
+                    print(f"第 {slot + 1} 格目标仍存在或消失未稳定确认（文字置信度 {score:.2f}），点击招牌商品九次后重试。")
                     for _ in range(FEATURED_CLICKS):
                         if quit_requested.is_set() or not active.is_set():
                             break
@@ -408,7 +399,7 @@ def main():
                     if quit_requested.is_set() or not active.is_set():
                         continue
                     time.sleep(0.7)
-                    success, score = click_target_and_check(sct, templates, slot)
+                    success, score = click_target_and_check(sct, ocr_engine, slot)
                     if success is None:
                         continue
                     if not success:
@@ -427,7 +418,7 @@ def main():
                 status_overlay.set_status("正在刷新", "点击刷新轮换商品")
             if not click_at(REFRESH_CLICK):
                 continue
-            time.sleep(0.9)
+            time.sleep(REFRESH_WAIT)
 
     print("程序已退出。")
     return 0
@@ -444,4 +435,6 @@ if __name__ == "__main__":
             hotkey_thread.join(timeout=1.0)
         if status_overlay:
             status_overlay.close()
+
+
 
