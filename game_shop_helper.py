@@ -6,6 +6,14 @@ F8：开始/暂停    F9：退出
 """
 # 必须在图形/鼠标库导入前启用物理屏幕坐标，避免 Windows 缩放造成坐标偏移。
 import ctypes
+import json
+import os
+import subprocess
+import threading
+import time
+import unicodedata
+from pathlib import Path
+
 try:
     dpi_ok = ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
 except (AttributeError, OSError, TypeError, ValueError):
@@ -21,14 +29,6 @@ if not dpi_ok:
         ctypes.windll.user32.SetProcessDPIAware()
     except (AttributeError, OSError, TypeError, ValueError):
         pass
-
-import time
-import threading
-import unicodedata
-import json
-import os
-import subprocess
-from pathlib import Path
 
 import cv2
 import mss
@@ -118,7 +118,7 @@ def game_window_geometry():
 
 
 def find_game_window():
-    """按 March7thAssistant 使用的游戏进程名/窗口标题定位游戏。"""
+    """按游戏进程名和窗口标题定位游戏。"""
     candidates = []
 
     def visit(hwnd, _):
@@ -615,7 +615,7 @@ def navigate_to_shop(sct, ocr):
 
             if guide_step == "await_homepage":
                 if time.monotonic() - guide_step_at >= PARTICIPATE_TIMEOUT and not world_interaction_sent:
-                    # 参考 M7A 的 guide5 -> currency_wars_homepage 超时动作：传送后补按一次 F。
+                    # 传送后补按一次 F，完成货币战争入口交互。
                     print("货币战争页面等待超时，按一次 F 完成交互。")
                     if _send_game_key("f"):
                         world_interaction_sent = True
@@ -678,7 +678,7 @@ def pause_with_error(message):
 
 
 def hotkey_listener():
-    """使用与 March7thAssistant 相同的全局键盘钩子，并以系统轮询作备用。"""
+    """监听全局 F8/F9；键盘钩子不可用时使用系统按键轮询。"""
     user32 = ctypes.windll.user32
     f8_was_down = False
     f9_was_down = False

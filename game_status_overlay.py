@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""轻量级、鼠标穿透的游戏状态悬浮窗，参考 March7thAssistant 的日志覆盖层。"""
+"""轻量级、鼠标穿透的游戏状态悬浮窗。"""
 import threading
 import win32api
 import win32con
